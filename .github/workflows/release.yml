@@ -1,5 +1,7 @@
 name: Release
 
+# tag 约定：<mod_id>-<mc_version>-<loader>-<mod_version>
+# 例：netsourcecasting-1.21.1-neoforge-1.0.1
 on:
   push:
     tags:
@@ -8,7 +10,194 @@ on:
 permissions:
   contents: write
 
+# 同一 tag 只跑一个 release：推错 tag 后删掉重推时，两个 run 会同时去建同一个 Release。
+# 不设 cancel-in-progress——发布跑一半被掐断会留下「tag 在、Release 不在」的半截状态。
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   release:
-    uses: pasze888/mc-mod-ci/.github/workflows/release.yml@main
-    secrets: inherit
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      # 手动触发（workflow_dispatch）时 ref 是分支而非 tag，必须有 tag 才继续
+      - name: "Guard: tag ref required"
+        if: ${{ github.ref_type != 'tag' }}
+        run: |
+          echo "::error::Release 只应在推送 tag 时触发，已中止。"
+          exit 1
+
+      - name: Checkout tagged source
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # JDK 与 build.yml 同源：读 gradle.properties 的 java_version，缺失时回退 21。
+      - name: Resolve JDK version
+        id: java
+        shell: bash
+        run: |
+          VERSION="$(sed -nE 's/^[[:space:]]*(java_version|javaVersion)[[:space:]]*=[[:space:]]*//p' gradle.properties | tail -1 | tr -d '\r[:space:]')"
+          if [ -z "$VERSION" ]; then
+            VERSION="21"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "使用 JDK $VERSION（来源：gradle.properties）"
+
+      - name: Set up JDK ${{ steps.java.outputs.version }}
+        uses: actions/setup-java@v6.0.0
+        with:
+          java-version: ${{ steps.java.outputs.version }}
+          distribution: temurin
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6.3.0
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Read project metadata
+        id: props
+        shell: bash
+        run: |
+          mod_name=""
+          mod_id=""
+          mc_version=""
+          mod_version=""
+          cf_id=""
+          if [ -f gradle.properties ]; then
+            mod_name="$(sed -n 's/^mod_name[[:space:]]*=[[:space:]]*//p' gradle.properties | tail -1 | tr -d '\r')"
+            mod_id="$(sed -nE 's/^[[:space:]]*mod_id[[:space:]]*=[[:space:]]*//p' gradle.properties | tail -1 | tr -d '\r[:space:]')"
+            mc_version="$(sed -nE 's/^[[:space:]]*minecraft_version[[:space:]]*=[[:space:]]*//p' gradle.properties | tail -1 | tr -d '\r[:space:]')"
+            mod_version="$(sed -nE 's/^[[:space:]]*mod_version[[:space:]]*=[[:space:]]*//p' gradle.properties | tail -1 | tr -d '\r[:space:]')"
+            cf_id="$(sed -n 's/^curseforge_project_id[[:space:]]*=[[:space:]]*//p' gradle.properties | tail -1 | tr -d '\r[:space:]')"
+          fi
+          if [ -z "$mc_version" ]; then
+            echo "minecraft_version 未在 gradle.properties 中找到" >&2
+            exit 1
+          fi
+          if [ -z "$mod_id" ]; then
+            echo "mod_id 未在 gradle.properties 中找到" >&2
+            exit 1
+          fi
+          if [ -z "$mod_version" ]; then
+            echo "mod_version 未在 gradle.properties 中找到" >&2
+            exit 1
+          fi
+          echo "mod_name=${mod_name}" >> "$GITHUB_OUTPUT"
+          echo "mod_id=${mod_id}" >> "$GITHUB_OUTPUT"
+          echo "mc_version=${mc_version}" >> "$GITHUB_OUTPUT"
+          echo "mod_version=${mod_version}" >> "$GITHUB_OUTPUT"
+          echo "curseforge_project_id=${cf_id}" >> "$GITHUB_OUTPUT"
+
+      # 版本号取 tag 的第 4 段起（tag 固定为 mod_id-mc_version-loader-version）：
+      # 这样 1.0.0-beta.1 这类预发布也整体落进版本号，而不是被 "##*-" 截成 beta.1。
+      - name: Derive version from tag
+        id: version
+        shell: bash
+        env:
+          PROPS_MOD_ID: ${{ steps.props.outputs.mod_id }}
+          PROPS_MC_VERSION: ${{ steps.props.outputs.mc_version }}
+          PROPS_MOD_VERSION: ${{ steps.props.outputs.mod_version }}
+          PROPS_LOADER: neoforge
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+
+          # tag 四段里前三段是可校验的元信息，先拆出来对照 gradle.properties。
+          # 段数不足时 cut 各自返回空串，由后面的非空检查统一报错。
+          get_seg() { printf '%s' "$TAG" | cut -d- -f"$1"; }
+          TAG_MOD_ID="$(get_seg 1)"
+          TAG_MC_VERSION="$(get_seg 2)"
+          TAG_LOADER="$(get_seg 3)"
+          VERSION="$(printf '%s' "$TAG" | cut -d- -f4-)"
+
+          # 解析失败时静默产出空版本会造出 netsourcecasting-.jar，必须在最前面拦住。
+          if [ -z "$VERSION" ]; then
+            echo "::error::无法从 tag '$TAG' 解析版本；约定为 <mod_id>-<mc_version>-<loader>-<version>"
+            exit 1
+          fi
+
+          # 元信息对不上会让 tag 与产物各说各话（如 tag 写 1.20、产物标注 1.21.1），
+          # 且 mc-publish 不校验这些字段，只能在这里挡。
+          if [ "$TAG_MOD_ID" != "$PROPS_MOD_ID" ]; then
+            echo "::error::tag 的 mod_id 段 '$TAG_MOD_ID' 与 gradle.properties 的 mod_id '$PROPS_MOD_ID' 不一致"
+            exit 1
+          fi
+          if [ "$TAG_MC_VERSION" != "$PROPS_MC_VERSION" ]; then
+            echo "::error::tag 的 mc_version 段 '$TAG_MC_VERSION' 与 gradle.properties 的 minecraft_version '$PROPS_MC_VERSION' 不一致"
+            exit 1
+          fi
+          if [ "$TAG_LOADER" != "$PROPS_LOADER" ]; then
+            echo "::error::tag 的 loader 段 '$TAG_LOADER' 与 release.yml 固定发布的 loader '$PROPS_LOADER' 不一致"
+            exit 1
+          fi
+
+          # tag 是版本号的唯一真相源：它经 -Pmod_version 覆盖 gradle.properties。
+          # 两者不等说明有人改了 properties 却没发版（或反之），此时报错，
+          # 让提交历史里始终能看到「发布版本 = 已提交的 mod_version」。
+          if [ "$VERSION" != "$PROPS_MOD_VERSION" ]; then
+            echo "::error::tag 版本 '$VERSION' 与 gradle.properties 的 mod_version '$PROPS_MOD_VERSION' 不一致；发版前先把 mod_version 改成相同值并提交"
+            exit 1
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          # 前三段校验通过后就是 mc-publish 的实际入参——让 tag 的每一段都有消费者，
+          # 而不是校验完就丢掉、转头去读 gradle.properties。
+          echo "mc_version=${TAG_MC_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "loader=${TAG_LOADER}" >> "$GITHUB_OUTPUT"
+          # 版本类型只分 alpha / beta，其余一律 release（约定见工作区 AGENTS.md）。
+          # 判错的后果：mc-publish 按 prerelease = version_type != release 填，
+          # 预发布会被当正式版发出去并抢占 Latest。
+          case "$VERSION" in
+            *-alpha*) TYPE="alpha"  ;;
+            *-beta*)  TYPE="beta"   ;;
+            *)        TYPE="release";;
+          esac
+          echo "version_type=${TYPE}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG} version=${VERSION} type=${TYPE}"
+          echo "校验通过：mod_id=${TAG_MOD_ID} mc=${TAG_MC_VERSION} loader=${TAG_LOADER}"
+
+      - name: Build with tag version
+        run: |
+          ./gradlew build --no-daemon -Pmod_version="${{ steps.version.outputs.version }}"
+
+      # 无 curseforge_project_id：只发 GitHub Release（不传任何 curseforge 参数，
+      # 否则 mc-publish 会按 slug 去探测 CurseForge 项目、导致失败）。
+      - name: "Publish GitHub Release only"
+        if: ${{ steps.props.outputs.curseforge_project_id == '' }}
+        uses: Kir-Antipov/mc-publish@v3.3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+          files: build/libs/!(*-@(sources|javadoc|dev|dev-shadow)).jar
+          name: ${{ steps.props.outputs.mod_name }} ${{ steps.version.outputs.version }}
+          version: ${{ steps.version.outputs.version }}
+          version-type: ${{ steps.version.outputs.version_type }}
+          loaders: ${{ steps.version.outputs.loader }}
+          game-versions: ${{ steps.version.outputs.mc_version }}
+          java: ${{ steps.java.outputs.version }}
+          environment: client | server
+          fail-mode: fail
+
+      # 有 curseforge_project_id：GitHub Release + CurseForge 一起发。
+      - name: "Publish GitHub Release + CurseForge"
+        if: ${{ steps.props.outputs.curseforge_project_id != '' }}
+        uses: Kir-Antipov/mc-publish@v3.3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+          curseforge-id: ${{ steps.props.outputs.curseforge_project_id }}
+          curseforge-token: ${{ secrets.CURSEFORGE_TOKEN }}
+
+          files: build/libs/!(*-@(sources|javadoc|dev|dev-shadow)).jar
+          name: ${{ steps.props.outputs.mod_name }} ${{ steps.version.outputs.version }}
+          version: ${{ steps.version.outputs.version }}
+          version-type: ${{ steps.version.outputs.version_type }}
+          loaders: ${{ steps.version.outputs.loader }}
+          game-versions: ${{ steps.version.outputs.mc_version }}
+          java: ${{ steps.java.outputs.version }}
+          environment: client | server
+          fail-mode: fail

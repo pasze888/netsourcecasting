@@ -53,7 +53,8 @@ base {
 }
 
 // Mojang ships Java 21 to end users in 1.21.1, so mods should target Java 21.
-java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+// 版本改由 gradle.properties 的 java_version 驱动，CI 的 JDK 读同一个键，两者不会各说各话。
+java.toolchain.languageVersion = JavaLanguageVersion.of(project.java_version as int)
 
 neoForge {
     // Specify the version of NeoForge to use.

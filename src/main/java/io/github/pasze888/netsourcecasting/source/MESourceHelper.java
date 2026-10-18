@@ -5,6 +5,7 @@ import appeng.api.features.GridLinkables;
 import appeng.api.networking.IGrid;
 import appeng.api.networking.security.IActionSource;
 import appeng.api.storage.StorageHelper;
+import appeng.integration.modules.curios.CuriosIntegration;
 import appeng.items.tools.powered.WirelessTerminalItem;
 import gripe._90.arseng.me.key.SourceKey;
 import net.minecraft.server.level.ServerPlayer;
@@ -22,6 +23,11 @@ import org.jetbrains.annotations.Nullable;
  * {@link StorageHelper#poweredExtraction}（同时受网络可用能量与存储量约束）。
  *
  * <p>本模组的语义是「直通网络」：不缓存魔源，每次施法按需现取。
+ *
+ * <p>终端来源沿用 AE2 的终端定位方式：主背包用 {@code PlayerInventory}，饰品槽用
+ * {@link CuriosIntegration#ITEM_HANDLER}——后者是 AE2 的 Curios 整合模块自己注册的能力值
+ * （{@code appeng.integration.modules.curios}，MIT），所以「装 Ars Nouveau 就一定装了 Curios」
+ * 这个前提不必再判断，能力值取不到就是跳过。
  */
 public final class MESourceHelper {
 
@@ -29,7 +35,7 @@ public final class MESourceHelper {
     }
 
     /**
-     * 把玩家背包里第一台可用的无线终端所指的网络包成一路来源。
+     * 把玩家身上第一台可用的无线终端所指的网络包成一路来源。
      *
      * <p>调用方必须先确认 AE2 与 Ars Énergistique 都在场——本类一被触碰就会用到它们的类型。
      *
@@ -51,7 +57,7 @@ public final class MESourceHelper {
     }
 
     /**
-     * 找出玩家背包中第一台「已绑定且网络可达」的 AE2 无线终端所对应的 ME 网络。
+     * 找出玩家身上第一台「已绑定且网络可达」的 AE2 无线终端所对应的 ME 网络。
      *
      * <p>这里刻意 <b>不做接入点范围校验</b>：只要终端绑定过接入点、且该接入点方块仍是有效网格节点，
      * 就认为可用（即「绑一次即可用」）。这是本模组的既定设计。
@@ -64,16 +70,33 @@ public final class MESourceHelper {
     public static IGrid findGrid(ServerPlayer player) {
         var inventory = player.getInventory();
         for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
-            ItemStack stack = inventory.getItem(slot);
-            if (!isLinkableTerminal(stack)) {
-                continue;
+            IGrid grid = gridFrom(player, inventory.getItem(slot));
+            if (grid != null) {
+                return grid;
             }
-            if (stack.getItem() instanceof WirelessTerminalItem terminal) {
-                IGrid grid = terminal.getLinkedGrid(stack, player.level(), null);
+        }
+        // 再看 Curios 饰品槽：这里用的是 AE2 自带无线终端热键（{@code appeng.hotkeys.CuriosHotkeyAction}）
+        // 用的同一个能力值 {@link CuriosIntegration#ITEM_HANDLER}，不引入 Curios 自己的 API。
+        // 没装 Curios 时该能力值没有提供者，{@code getCapability} 返回 {@code null}，等价于跳过。
+        var curios = player.getCapability(CuriosIntegration.ITEM_HANDLER);
+        if (curios != null) {
+            for (int slot = 0; slot < curios.getSlots(); slot++) {
+                IGrid grid = gridFrom(player, curios.getStackInSlot(slot));
                 if (grid != null) {
                     return grid;
                 }
             }
+        }
+        return null;
+    }
+
+    /** 一件物品若是「已绑定且网络可达」的无线终端，返回它指向的 ME 网络。 */
+    private static @Nullable IGrid gridFrom(ServerPlayer player, ItemStack stack) {
+        if (!isLinkableTerminal(stack)) {
+            return null;
+        }
+        if (stack.getItem() instanceof WirelessTerminalItem terminal) {
+            return terminal.getLinkedGrid(stack, player.level(), null);
         }
         return null;
     }

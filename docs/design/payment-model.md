@@ -11,7 +11,7 @@
 
 | 来源 | 什么情况下算可用 | 前置 |
 |---|---|---|
-| ME 网络 | 装了 AE2 与 Ars Énergistique，背包里有一台已绑定接入点的 AE2 无线终端，且绑定的接入点仍是有效网格节点 | Ars Énergistique 提供 ME 魔源键 `arseng:source` |
+| ME 网络 | 装了 AE2 与 Ars Énergistique，身上（主背包或 Curios 饰品槽）有一台已绑定接入点的 AE2 无线终端，且绑定的接入点仍是有效网格节点 | Ars Énergistique 提供 ME 魔源键 `arseng:source` |
 | 超越维度的维度网络 | 装了 Beyond Dimensions，玩家属于某个维度网络，且该网络被设为主网络 | 只认主网络 |
 
 两路都可用时，按配置 `sources.me_first` 的顺序依次抽取：默认先花 ME 网络的魔源，不够才动

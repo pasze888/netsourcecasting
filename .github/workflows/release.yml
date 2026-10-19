@@ -66,12 +66,14 @@ jobs:
           mod_id=""
           mc_version=""
           mod_version=""
+          loader=""
           cf_id=""
           if [ -f gradle.properties ]; then
             mod_name="$(sed -n 's/^mod_name[[:space:]]*=[[:space:]]*//p' gradle.properties | tail -1 | tr -d '\r')"
             mod_id="$(sed -nE 's/^[[:space:]]*mod_id[[:space:]]*=[[:space:]]*//p' gradle.properties | tail -1 | tr -d '\r[:space:]')"
             mc_version="$(sed -nE 's/^[[:space:]]*minecraft_version[[:space:]]*=[[:space:]]*//p' gradle.properties | tail -1 | tr -d '\r[:space:]')"
             mod_version="$(sed -nE 's/^[[:space:]]*mod_version[[:space:]]*=[[:space:]]*//p' gradle.properties | tail -1 | tr -d '\r[:space:]')"
+            loader="$(sed -nE 's/^[[:space:]]*mod_loader[[:space:]]*=[[:space:]]*//p' gradle.properties | tail -1 | tr -d '\r[:space:]')"
             cf_id="$(sed -n 's/^curseforge_project_id[[:space:]]*=[[:space:]]*//p' gradle.properties | tail -1 | tr -d '\r[:space:]')"
           fi
           if [ -z "$mc_version" ]; then
@@ -86,14 +88,21 @@ jobs:
             echo "mod_version 未在 gradle.properties 中找到" >&2
             exit 1
           fi
+          if [ -z "$loader" ]; then
+            echo "mod_loader 未在 gradle.properties 中找到" >&2
+            exit 1
+          fi
           echo "mod_name=${mod_name}" >> "$GITHUB_OUTPUT"
           echo "mod_id=${mod_id}" >> "$GITHUB_OUTPUT"
           echo "mc_version=${mc_version}" >> "$GITHUB_OUTPUT"
           echo "mod_version=${mod_version}" >> "$GITHUB_OUTPUT"
+          echo "loader=${loader}" >> "$GITHUB_OUTPUT"
           echo "curseforge_project_id=${cf_id}" >> "$GITHUB_OUTPUT"
 
-      # 版本号取 tag 的第 4 段起（tag 固定为 mod_id-mc_version-loader-version）：
-      # 这样 1.0.0-beta.1 这类预发布也整体落进版本号，而不是被 "##*-" 截成 beta.1。
+      # tag 结构为 <mod_id>-<mc_version>-<loader>-<mod_version>，与 jar 文件名一致。
+      # 切分不按固定段号：MC 预发布版本（1.21.1-pre1、26.1-snapshot2）自带连字符，
+      # 段数会变。改为以 "-<loader>-" 为锚点左右切——loader 段固定且唯一，
+      # 左边是 mod_id + mc_version，右边整体是 mod_version（预发布后缀原样保留）。
       - name: Derive version from tag
         id: version
         shell: bash
@@ -101,21 +110,33 @@ jobs:
           PROPS_MOD_ID: ${{ steps.props.outputs.mod_id }}
           PROPS_MC_VERSION: ${{ steps.props.outputs.mc_version }}
           PROPS_MOD_VERSION: ${{ steps.props.outputs.mod_version }}
-          PROPS_LOADER: neoforge
+          PROPS_LOADER: ${{ steps.props.outputs.loader }}
         run: |
           TAG="${GITHUB_REF_NAME}"
 
-          # tag 四段里前三段是可校验的元信息，先拆出来对照 gradle.properties。
-          # 段数不足时 cut 各自返回空串，由后面的非空检查统一报错。
-          get_seg() { printf '%s' "$TAG" | cut -d- -f"$1"; }
-          TAG_MOD_ID="$(get_seg 1)"
-          TAG_MC_VERSION="$(get_seg 2)"
-          TAG_LOADER="$(get_seg 3)"
-          VERSION="$(printf '%s' "$TAG" | cut -d- -f4-)"
+          # 锚点不唯一（loader 段在 tag 里出现多次）或不存在时，后续校验都不可信。
+          ANCHOR="-${PROPS_LOADER}-"
+          count="$(( $(printf '%s' "$TAG" | grep -o -- "$ANCHOR" | wc -l) ))"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::tag '$TAG' 里找不到 loader 段 '${PROPS_LOADER}'；约定为 <mod_id>-<mc_version>-<loader>-<mod_version>"
+            exit 1
+          fi
+          if [ "$count" -gt 1 ]; then
+            echo "::error::tag '$TAG' 里 loader 段 '${PROPS_LOADER}' 出现 $count 次，无法确定切分位置"
+            exit 1
+          fi
+
+          PREFIX="${TAG%%${ANCHOR}*}"          # <mod_id>-<mc_version>
+          VERSION="${TAG#*${ANCHOR}}"          # <mod_version>，预发布后缀原样保留
+
+          # mod_id 不含连字符，故前缀的第一个 "-" 之后就是 mc_version。
+          TAG_MOD_ID="${PREFIX%%-*}"
+          TAG_MC_VERSION="${PREFIX#*-}"
+          TAG_LOADER="${PROPS_LOADER}"
 
           # 解析失败时静默产出空版本会造出 netsourcecasting-.jar，必须在最前面拦住。
-          if [ -z "$VERSION" ]; then
-            echo "::error::无法从 tag '$TAG' 解析版本；约定为 <mod_id>-<mc_version>-<loader>-<version>"
+          if [ -z "$VERSION" ] || [ -z "$TAG_MOD_ID" ] || [ -z "$TAG_MC_VERSION" ]; then
+            echo "::error::无法从 tag '$TAG' 解析；约定为 <mod_id>-<mc_version>-<loader>-<mod_version>"
             exit 1
           fi
 
@@ -129,10 +150,6 @@ jobs:
             echo "::error::tag 的 mc_version 段 '$TAG_MC_VERSION' 与 gradle.properties 的 minecraft_version '$PROPS_MC_VERSION' 不一致"
             exit 1
           fi
-          if [ "$TAG_LOADER" != "$PROPS_LOADER" ]; then
-            echo "::error::tag 的 loader 段 '$TAG_LOADER' 与 release.yml 固定发布的 loader '$PROPS_LOADER' 不一致"
-            exit 1
-          fi
 
           # tag 是版本号的唯一真相源：它经 -Pmod_version 覆盖 gradle.properties。
           # 两者不等说明有人改了 properties 却没发版（或反之），此时报错，
@@ -144,7 +161,7 @@ jobs:
 
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          # 前三段校验通过后就是 mc-publish 的实际入参——让 tag 的每一段都有消费者，
+          # 解析出的三段就是 mc-publish 的实际入参——让 tag 的每一段都有消费者，
           # 而不是校验完就丢掉、转头去读 gradle.properties。
           echo "mc_version=${TAG_MC_VERSION}" >> "$GITHUB_OUTPUT"
           echo "loader=${TAG_LOADER}" >> "$GITHUB_OUTPUT"
@@ -164,6 +181,42 @@ jobs:
         run: |
           ./gradlew build --no-daemon -Pmod_version="${{ steps.version.outputs.version }}"
 
+      # mc-publish 按磁盘上的文件名上传，没有重命名能力（github-api-client.ts 直接取
+      # FileInfo.name）。所以把产物改成与 tag 同名的结构在这里做，build.gradle 保持
+      # 原样——构建产物叫什么由构建系统决定，发布出去叫什么由发布流程决定。
+      - name: Rename artifact to tag structure
+        id: artifact
+        shell: bash
+        env:
+          PROPS_MOD_ID: ${{ steps.props.outputs.mod_id }}
+          VERSION: ${{ steps.version.outputs.version }}
+          MC_VERSION: ${{ steps.version.outputs.mc_version }}
+          LOADER: ${{ steps.version.outputs.loader }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # 只要主产物；sources/javadoc/dev 之类的旁挂 jar 不参与发布。
+          jars=(build/libs/*.jar)
+          for f in "${jars[@]}"; do
+            case "$f" in
+              *-sources.jar|*-javadoc.jar|*-dev.jar|*-dev-shadow.jar) continue ;;
+            esac
+            MAIN_JAR="$f"
+            break
+          done
+          if [ -z "${MAIN_JAR:-}" ]; then
+            echo "::error::build/libs 下没有可发布的主 jar"
+            exit 1
+          fi
+
+          TARGET="build/libs/${PROPS_MOD_ID}-${MC_VERSION}-${LOADER}-${VERSION}.jar"
+          mv "$MAIN_JAR" "$TARGET"
+          echo "重命名：$(basename "$MAIN_JAR") -> $(basename "$TARGET")"
+
+          # 只发布这一个 jar，避免同目录残留被 glob 一并带走。
+          echo "path=${TARGET}" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$TARGET")" >> "$GITHUB_OUTPUT"
+
       # 无 curseforge_project_id：只发 GitHub Release（不传任何 curseforge 参数，
       # 否则 mc-publish 会按 slug 去探测 CurseForge 项目、导致失败）。
       - name: "Publish GitHub Release only"
@@ -172,7 +225,7 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-          files: build/libs/!(*-@(sources|javadoc|dev|dev-shadow)).jar
+          files: ${{ steps.artifact.outputs.path }}
           name: ${{ steps.props.outputs.mod_name }} ${{ steps.version.outputs.version }}
           version: ${{ steps.version.outputs.version }}
           version-type: ${{ steps.version.outputs.version_type }}
@@ -192,7 +245,7 @@ jobs:
           curseforge-id: ${{ steps.props.outputs.curseforge_project_id }}
           curseforge-token: ${{ secrets.CURSEFORGE_TOKEN }}
 
-          files: build/libs/!(*-@(sources|javadoc|dev|dev-shadow)).jar
+          files: ${{ steps.artifact.outputs.path }}
           name: ${{ steps.props.outputs.mod_name }} ${{ steps.version.outputs.version }}
           version: ${{ steps.version.outputs.version }}
           version-type: ${{ steps.version.outputs.version_type }}
